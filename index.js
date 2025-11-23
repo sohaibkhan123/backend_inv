@@ -5,7 +5,7 @@ const db = require('./db');
 const crypto = require('crypto');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5000 || "*";
 
 // Increase limit for base64 image uploads
 app.use(express.json({ limit: '50mb' }));
