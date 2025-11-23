@@ -3,19 +3,77 @@ const express = require('express');
 const cors = require('cors');
 const db = require('./db');
 const crypto = require('crypto');
+const compression = require('compression');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 
 const app = express();
-const PORT = process.env.PORT || 5000 || "*";
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-key-change-this';
+
+// PERFORMANCE: GZIP Compression
+app.use(compression());
 
 // Increase limit for base64 image uploads
 app.use(express.json({ limit: '50mb' }));
-app.use(cors());
+
+// CORS Configuration
+app.use(cors({
+  origin: process.env.FRONTEND_URL || '*', 
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// --- MIDDLEWARE: Authenticate Token ---
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+
+  if (!token) return res.sendStatus(401);
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) return res.sendStatus(403);
+    req.user = user;
+    next();
+  });
+};
+
+// --- MIDDLEWARE: Role Check ---
+const requireRole = (roles) => {
+    return (req, res, next) => {
+        if (!req.user || !roles.includes(req.user.role)) {
+            return res.status(403).json({ error: "Access denied. Insufficient permissions." });
+        }
+        next();
+    };
+};
+
+// --- AUTH ROUTES ---
+
+// Login
+app.post('/api/login', async (req, res) => {
+    const { username, password } = req.body;
+    
+    try {
+        const [users] = await db.execute('SELECT * FROM users WHERE username = ?', [username]);
+        if (users.length === 0) return res.status(401).json({ error: "Invalid credentials" });
+
+        const user = users[0];
+        const validPassword = await bcrypt.compare(password, user.password);
+        if (!validPassword) return res.status(401).json({ error: "Invalid credentials" });
+
+        const token = jwt.sign({ username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '12h' });
+        
+        res.json({ token, role: user.role, username: user.username });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 
 // --- Helper ---
-// Convert flat SQL rows (joined) into nested JSON structure
 const formatItems = (rows) => {
     const itemsMap = {};
-    
     rows.forEach(row => {
         if (!itemsMap[row.id]) {
             itemsMap[row.id] = {
@@ -31,7 +89,6 @@ const formatItems = (rows) => {
                 usage: []
             };
         }
-
         if (row.usage_id) {
             itemsMap[row.id].usage.push({
                 id: row.usage_id,
@@ -43,14 +100,13 @@ const formatItems = (rows) => {
             });
         }
     });
-
     return Object.values(itemsMap);
 };
 
-// --- ROUTES ---
+// --- INVENTORY ROUTES ---
 
-// GET All Items
-app.get('/api/inventory', async (req, res) => {
+// GET All Items (Protected: All authenticated users)
+app.get('/api/inventory', authenticateToken, async (req, res) => {
   try {
     const [rows] = await db.execute(`
         SELECT 
@@ -72,8 +128,8 @@ app.get('/api/inventory', async (req, res) => {
   }
 });
 
-// POST Batch (CSV Upload)
-app.post('/api/inventory/batch', async (req, res) => {
+// POST Batch (Protected: Incharge Only)
+app.post('/api/inventory/batch', authenticateToken, requireRole(['incharge']), async (req, res) => {
     const items = req.body;
     if (!Array.isArray(items) || items.length === 0) {
         return res.status(400).json({ error: "Invalid data" });
@@ -82,9 +138,7 @@ app.post('/api/inventory/batch', async (req, res) => {
     const connection = await db.getConnection();
     try {
         await connection.beginTransaction();
-
         const query = `INSERT INTO items (id, itemCode, prNumber, description, weight, prQty, requiredQty, receivedQty, projectId) VALUES ?`;
-        
         const values = items.map(item => [
             crypto.randomUUID(),
             item.itemCode,
@@ -96,10 +150,8 @@ app.post('/api/inventory/batch', async (req, res) => {
             item.receivedQty,
             item.projectId
         ]);
-
         await connection.query(query, [values]);
         await connection.commit();
-        
         res.status(201).json({ message: "Batch import successful" });
     } catch (error) {
         await connection.rollback();
@@ -110,18 +162,16 @@ app.post('/api/inventory/batch', async (req, res) => {
     }
 });
 
-// POST Single Item
-app.post('/api/inventory', async (req, res) => {
+// POST Single Item (Protected: Incharge Only)
+app.post('/api/inventory', authenticateToken, requireRole(['incharge']), async (req, res) => {
   const { itemCode, prNumber, description, weight, prQty, requiredQty, receivedQty, projectId } = req.body;
   const id = crypto.randomUUID();
-  
   try {
     await db.execute(
         `INSERT INTO items (id, itemCode, prNumber, description, weight, prQty, requiredQty, receivedQty, projectId) 
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [id, itemCode, prNumber, description, weight, prQty, requiredQty, receivedQty, projectId]
     );
-    
     res.status(201).json({ 
         id, itemCode, prNumber, description, weight, prQty, requiredQty, receivedQty, projectId, usage: [] 
     });
@@ -130,8 +180,8 @@ app.post('/api/inventory', async (req, res) => {
   }
 });
 
-// PUT Update Item
-app.put('/api/inventory/:id', async (req, res) => {
+// PUT Update Item (Protected: Incharge Only)
+app.put('/api/inventory/:id', authenticateToken, requireRole(['incharge']), async (req, res) => {
   const { itemCode, prNumber, description, weight, prQty, requiredQty, receivedQty, projectId } = req.body;
   try {
     await db.execute(
@@ -144,8 +194,8 @@ app.put('/api/inventory/:id', async (req, res) => {
   }
 });
 
-// DELETE Item
-app.delete('/api/inventory/:id', async (req, res) => {
+// DELETE Item (Protected: Incharge Only)
+app.delete('/api/inventory/:id', authenticateToken, requireRole(['incharge']), async (req, res) => {
   try {
     await db.execute('DELETE FROM items WHERE id = ?', [req.params.id]);
     res.status(204).send();
@@ -154,11 +204,10 @@ app.delete('/api/inventory/:id', async (req, res) => {
   }
 });
 
-// POST Add Usage
-app.post('/api/inventory/:id/usage', async (req, res) => {
+// POST Add Usage (Protected: Incharge AND Store)
+app.post('/api/inventory/:id/usage', authenticateToken, requireRole(['incharge', 'store']), async (req, res) => {
   const { projectId, quantity, date, issuedTo, issueSlipImage } = req.body;
   const usageId = crypto.randomUUID();
-  
   try {
     await db.execute(
         `INSERT INTO usage_logs (id, itemId, projectId, quantity, date, issuedTo, issueSlipImage) VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -170,8 +219,8 @@ app.post('/api/inventory/:id/usage', async (req, res) => {
   }
 });
 
-// DELETE Usage
-app.delete('/api/inventory/:itemId/usage/:usageId', async (req, res) => {
+// DELETE Usage (Protected: Incharge AND Store)
+app.delete('/api/inventory/:itemId/usage/:usageId', authenticateToken, requireRole(['incharge', 'store']), async (req, res) => {
   try {
     await db.execute('DELETE FROM usage_logs WHERE id = ?', [req.params.usageId]);
     res.status(204).send();
